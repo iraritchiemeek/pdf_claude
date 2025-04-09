@@ -1,4 +1,4 @@
-anthropic
-httpx
 python-dotenv 
 PyPDF2
+pydantic
+pydantic_ai
