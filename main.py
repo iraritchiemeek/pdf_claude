@@ -4,64 +4,29 @@ from dotenv import load_dotenv
 import PyPDF2
 from io import BytesIO
 import json
+import re
 import os
 import argparse
 from pathlib import Path
-from typing import Literal, Optional
-from pydantic import BaseModel
-from pydantic_ai import Agent
 
 load_dotenv()
 
-class Publication(BaseModel):
-    publication: Literal["activist", "transport worker", "national conference", "other"]
-    date: str  # in mm/yyyy or yyyy format
-    headline: str
+def extract_json(text):
+    pattern = r'```(?:json)?\s*(\{.*?\})\s*```'
+    json_match = re.search(pattern, text, re.DOTALL)
+    
+    if json_match:
+        return json_match.group(1)
+    
+    bracket_pattern = r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})'
+    bracket_match = re.search(bracket_pattern, text, re.DOTALL)
+    
+    if bracket_match:
+        return bracket_match.group(1)
+    
+    return None
 
-class DocumentAnalyzer(Agent):
-    def analyze_document(self, filename: str, pdf_data: str) -> Publication:
-        """
-        Analyze a PDF document and extract publication information.
-        
-        Args:
-            filename: The name of the PDF file
-            pdf_data: Base64-encoded PDF data
-            
-        Returns:
-            Publication object containing publication type, date, and headline
-        """
-        return self.model(
-            user=[
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": pdf_data
-                    }
-                },
-                {
-                    "type": "text",
-                    "text": f"""
-Please analyze this document (filename: {filename}) and extract the following information:
-
-1. The publication name (select one):
-   - activist
-   - transport worker
-   - national conference
-   - other
-
-2. The date (format as mm/yyyy or yyyy)
-
-3. The headline
-
-Consider both the document content and filename when determining the information.
-"""
-                }
-            ]
-        )
-
-def process_pdf(pdf_path, analyzer):
+def process_pdf(pdf_path, client):
     print(f"Processing: {pdf_path}")
     
     with open(pdf_path, "rb") as f:
@@ -78,35 +43,85 @@ def process_pdf(pdf_path, analyzer):
         
         pdf_data = base64.standard_b64encode(first_page_bytes.read()).decode("utf-8")
 
-    try:
-        # Use the analyzer to extract structured information
-        result = analyzer.analyze_document(pdf_path.name, pdf_data)
-        
-        # Save the result to a text file
-        txt_filename = pdf_path.with_suffix('.txt')
-        with open(txt_filename, 'w') as txt_file:
-            json.dump(result.model_dump(), txt_file, indent=2)
-        
-        print(f"Successfully created {txt_filename} with the JSON response")
-        return True
+    message = client.messages.create(
+        model="claude-3-7-sonnet-20250219",
+        max_tokens=1024,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_data
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": f"""
+Please analyze this document (filename: {pdf_path.name}) and extract the following information:
+
+1. The publication name (select one):
+   - activist
+   - transport worker
+   - national conference
+   - other
+
+2. The date (format as mm/yyyy or yyyy)
+
+3. The headline
+
+Consider both the document content and filename when determining the information.
+
+Respond only with valid JSON using this format:
+{{
+  "publication": "string (one of the categories listed above)",
+  "date": "string (in mm/yyyy or yyyy format)",
+  "headline": "string"
+}}
+"""
+                    }
+                ]
+            }
+        ],
+    )
+
+    response_content = message.content
+    txt_filename = pdf_path.with_suffix('.txt')
+
+    if isinstance(response_content, list):
+        text_content = ""
+        for item in response_content:
+            if hasattr(item, 'text'):
+                text_content += item.text
+        response_content = text_content
+
+    json_str = extract_json(response_content)
+    if json_str:
+        try:
+            parsed_json = json.loads(json_str)
+            with open(txt_filename, 'w') as txt_file:
+                json.dump(parsed_json, txt_file, indent=2)
+            print(f"Successfully created {txt_filename} with the JSON response")
+            return True
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse JSON: {e}")
+            print("Extracted content:", json_str)
+    else:
+        print("Could not extract JSON from the response")
+        print("Response content:", response_content)
     
-    except Exception as e:
-        print(f"Error analyzing document: {e}")
-        return False
+    return False
 
 def main():
-    parser = argparse.ArgumentParser(description='Process PDF files and extract information using Claude with PydanticAI')
+    parser = argparse.ArgumentParser(description='Process PDF files and extract information using Claude')
     parser.add_argument('--count', type=int, default=None, help='Number of PDFs to process')
     parser.add_argument('--offset', type=int, default=0, help='Number of PDFs to skip')
-    parser.add_argument('--model', type=str, default="claude-3-7-sonnet-20250219", help='Model to use for analysis')
     args = parser.parse_args()
     
-    # Create the document analyzer agent
-    analyzer = DocumentAnalyzer(
-        model_name=args.model,
-        anthropic_api_key=os.getenv("ANTHROPIC_API_KEY")
-    )
-    
+    client = anthropic.Anthropic()
     pdf_dir = Path("pdfs")
     
     if not pdf_dir.exists() or not pdf_dir.is_dir():
@@ -130,7 +145,7 @@ def main():
     failed = 0
     
     for pdf_path in pdf_files:
-        result = process_pdf(pdf_path, analyzer)
+        result = process_pdf(pdf_path, client)
         if result:
             successful += 1
         else:

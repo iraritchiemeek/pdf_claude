@@ -1,3 +1,4 @@
 /pdfs/*
 .env
 .DS_Store
+venv/
